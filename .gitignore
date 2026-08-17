@@ -1,0 +1,28 @@
+# macOS
+.DS_Store
+
+# Xcode 빌드 산출물
+build/
+DerivedData/
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+
+# 배포용 패키지 (릴리스 때 다시 만든다)
+dist/
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+# 기타
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Claude Code 로컬 설정 (개인 환경용)
+# 슬래시가 든 패턴은 이 파일 위치 기준으로만 맞으므로 **/를 붙여 하위 폴더까지 잡는다
+**/.claude/settings.local.json
