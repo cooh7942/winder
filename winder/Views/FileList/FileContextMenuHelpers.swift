@@ -1,10 +1,14 @@
 import SwiftUI
+import AppKit
 
 // MARK: - 드롭 처리 (아이콘/목록/갤러리 보기 공용)
 
 /// 끌어다 놓은 파일을 destination 폴더로 보낸다. destination이 nil이거나 규칙에 어긋나면 거부.
-/// SwiftUI dropDestination에는 수정자 키 정보가 없어 항상 복사로 처리한다
-/// (⌘를 눌러 이동하는 동작은 자세히 보기에서만 지원).
+///
+/// 그냥 끌면 복사, ⌘를 누른 채 놓으면 이동 — 자세히 보기·탐색 창 트리와 같은 규칙이다.
+/// SwiftUI dropDestination은 NSDraggingInfo를 주지 않아 수정자 키를 알 수 없으므로,
+/// 놓는 순간의 NSEvent.modifierFlags를 직접 읽는다
+/// (자세히 보기는 AppKit이 수정자에 맞춰 좁혀 주는 draggingSourceOperationMask로 같은 판정을 한다).
 @MainActor
 func handleFileListDrop(_ urls: [URL], into destination: URL?,
                         onAction: (DetailsAction) -> Void) -> Bool {
@@ -18,7 +22,8 @@ func handleFileListDrop(_ urls: [URL], into destination: URL?,
             || srcStd.deletingLastPathComponent() == dst
     }
     guard !invalid else { return false }
-    onAction(.dropItems(urls: urls, destination: destination, isCopy: true))
+    let isCopy = !NSEvent.modifierFlags.contains(.command)
+    onAction(.dropItems(urls: urls, destination: destination, isCopy: isCopy))
     return true
 }
 

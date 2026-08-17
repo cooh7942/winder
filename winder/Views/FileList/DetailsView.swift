@@ -10,6 +10,8 @@ enum DetailsAction {
     case open(FileItem)
     /// 이름 변경 모드 진입 요청 (newName == "") 또는 커밋 (newName != "")
     case rename(FileItem, String)
+    /// 이름 변경 취소 (Esc) — 뷰모델의 진행 중 상태를 푼다
+    case renameCancelled
     case delete
     /// ⇧Delete: 휴지통 없이 영구 삭제 — 확인 다이얼로그 경유
     case permanentDelete
@@ -358,6 +360,9 @@ final class DetailsViewCoordinator: NSObject,
                 if let item = self.items.first(where: { $0.id == self.renamingItemID }) {
                     self.onAction(.rename(item, newName))
                 }
+            }
+            cell.onRenameCancel = { [weak self] in
+                self?.onAction(.renameCancelled)
             }
         }
         return cell
@@ -709,9 +714,13 @@ final class WinTableView: NSTableView {
         onDragFeedbackShouldClear?()
     }
 
-    /// 드롭 없이 끝난 드래그(취소 등)는 draggingExited가 오지 않을 수 있다
+    /// 드롭 없이 끝난 드래그(취소 등)는 draggingExited가 오지 않을 수 있다.
+    ///
+    /// super를 부르면 안 된다 — draggingEnded:는 NSView·NSTableView 어디에도 구현이 없는
+    /// 선택 메서드라 상위로 보내면 unrecognized selector 예외가 난다. AppKit이 그 예외를
+    /// 삼켜 앱은 살아남지만 드래그 관리자가 망가진 채 남아, 그 뒤로 SwiftUI 쪽
+    /// .onDrag/.draggable(아이콘·목록·갤러리 보기)이 아예 시작되지 않는다
     override func draggingEnded(_ sender: any NSDraggingInfo) {
-        super.draggingEnded(sender)
         onDragFeedbackShouldClear?()
     }
 
@@ -768,6 +777,10 @@ final class WinDropBorderView: NSView {
 final class WinTableCellView: NSTableCellView {
     /// 이름 변경 커밋 핸들러 — coordinator가 연결
     var onRenameCommit: ((String) -> Void)?
+    /// 이름 변경 취소 핸들러 — coordinator가 연결
+    var onRenameCancel: (() -> Void)?
+    /// 이름 변경을 시작할 때의 이름 — 취소하면 보이는 글자를 이걸로 되돌린다
+    private var originalName: String = ""
     /// 인라인 이름 변경 진행 중 여부 — configure()가 편집 중인 텍스트를 덮어쓰지 않도록 보호
     private(set) var isRenaming: Bool = false
 
@@ -793,6 +806,7 @@ final class WinTableCellView: NSTableCellView {
         // 재사용 전에 이름 변경 상태 정리 (커밋하지 않고 취소)
         if isRenaming { endRenaming(commit: false) }
         onRenameCommit = nil
+        onRenameCancel = nil
     }
 
     /// 액센트 색으로 채워진 행 위에서는 글자를 흰색으로 — Finder와 같은 동작.
@@ -843,6 +857,7 @@ final class WinTableCellView: NSTableCellView {
     func startRenaming(currentName: String) {
         guard let tf = textField else { return }
         isRenaming = true
+        originalName = currentName
         tf.stringValue = currentName
         tf.isEditable = true
         tf.isSelectable = true
@@ -850,8 +865,12 @@ final class WinTableCellView: NSTableCellView {
         tf.backgroundColor = NSColor.textBackgroundColor
         tf.focusRingType = .exterior
         tf.delegate = self
+        // selectText(_:)를 부르면 안 된다 — 내부에서 window.endEditingFor:로 필드 편집기를
+        // 한 번 걷어내는데, 그 과정이 controlTextDidEndEditing을 부른다. 우리 구현은 그걸
+        // "사용자가 편집을 끝냈다"로 보고 방금 켠 편집 모드를 도로 꺼 버렸다.
+        // (그래서 이름 바꾸기·새 폴더에서 편집 칸이 뜨자마자 사라졌다)
+        // makeFirstResponder만으로 편집기가 붙고 글자도 전체 선택된다.
         tf.window?.makeFirstResponder(tf)
-        tf.selectText(nil)
     }
 
     fileprivate func endRenaming(commit: Bool) {
@@ -864,8 +883,13 @@ final class WinTableCellView: NSTableCellView {
         tf.backgroundColor = .clear
         tf.focusRingType = .none
         tf.delegate = nil
-        if commit, !newName.isEmpty {
+        if commit, !newName.isEmpty, newName != originalName {
             onRenameCommit?(newName)
+        } else {
+            // 취소·빈 이름·그대로 — 보이던 글자를 되돌리고 뷰모델의 진행 상태도 푼다.
+            // 풀지 않으면 renamingItemID가 남아 같은 항목을 다시 이름 변경할 수 없다
+            tf.stringValue = originalName
+            onRenameCancel?()
         }
     }
 }

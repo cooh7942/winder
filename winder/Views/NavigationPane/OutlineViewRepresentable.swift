@@ -1383,9 +1383,13 @@ final class WinderOutlineView: NSOutlineView {
         onDragFeedbackShouldClear?()
     }
 
-    /// 드롭 없이 끝난 드래그(취소·허용되지 않는 위치에서 놓기)는 draggingExited가 오지 않을 수 있다
+    /// 드롭 없이 끝난 드래그(취소·허용되지 않는 위치에서 놓기)는 draggingExited가 오지 않을 수 있다.
+    ///
+    /// super를 부르면 안 된다 — draggingEnded:는 NSView·NSOutlineView 어디에도 구현이 없는
+    /// 선택 메서드라 상위로 보내면 unrecognized selector 예외가 난다. AppKit이 그 예외를
+    /// 삼켜 앱은 살아남지만 드래그 관리자가 망가진 채 남아, 그 뒤로 SwiftUI 쪽
+    /// .onDrag/.draggable(아이콘·목록·갤러리 보기)이 아예 시작되지 않는다
     override func draggingEnded(_ sender: any NSDraggingInfo) {
-        super.draggingEnded(sender)
         onDragFeedbackShouldClear?()
     }
 }

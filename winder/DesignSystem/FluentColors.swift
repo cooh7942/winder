@@ -53,9 +53,9 @@ enum FluentColors {
     static let selectionText          = NSColor.alternateSelectedControlTextColor
 
     // MARK: - 터미널
-    // 터미널은 앱 테마와 무관하게 항상 검은 배경 — 셸 프로그램들이 어두운 배경을 전제로 색을 쓴다
-    static let terminalBackground = NSColor.black
-    static let terminalForeground = NSColor(hex: "E6E6E6")
+    // 탐색 창 패널과 같은 바탕·글자색을 쓴다 — 창 안에서 따로 노는 검은 상자로 보이지 않도록
+    static let terminalBackground = sidebarBackground
+    static let terminalForeground = textPrimary
     static let terminalSelection  = NSColor(white: 1, alpha: 0.28)
 
     // MARK: - 드롭 대상 강조

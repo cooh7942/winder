@@ -76,6 +76,10 @@ final class TabViewModel: Identifiable {
     private var watcherTask: Task<Void, Never>?
     /// 현재 감시 중인 URL — 동일 URL 재시작으로 인한 churn 방지
     private var watchedURL: URL?
+    /// Winder 자신이 만든 변경 구독 — FSEvents가 IgnoreSelf로 걸러 내는 몫을 여기서 받는다.
+    /// 상자에 담아 두면 이 뷰모델이 사라질 때 상자가 함께 풀리며 알아서 해지된다
+    /// (@MainActor 클래스의 deinit에서는 격리된 프로퍼티를 만질 수 없다)
+    private let selfChangeObserver = NotificationObserverBox()
 
     // MARK: - 히스토리 접근자
     var canGoBack: Bool    { history.canGoBack }
@@ -97,6 +101,27 @@ final class TabViewModel: Identifiable {
         self.tabIcon  = location.systemIcon
         // 시작 폴더에 기억된 보기 모드로 연다
         self.viewMode = FolderViewModeStore.shared.mode(for: location.url)
+        observeSelfChanges()
+    }
+
+    /// Winder가 스스로 바꾼 폴더를 다시 읽는다.
+    ///
+    /// FileWatcher(FSEvents)는 kFSEventStreamCreateFlagIgnoreSelf라 우리 앱의 변경을 안 알려 준다.
+    /// 이게 없으면 옆 창으로 파일을 끌어다 놓거나 트리 폴더에 떨어뜨렸을 때
+    /// 파일은 복사되는데 목록에는 나타나지 않는다
+    private func observeSelfChanges() {
+        selfChangeObserver.token = NotificationCenter.default.addObserver(
+            forName: .winderDirectoriesDidChange, object: nil, queue: nil
+        ) { [weak self] note in
+            guard let dirs = note.userInfo?[FileOperationService.changedDirectoriesKey] as? Set<URL>
+            else { return }
+            Task { @MainActor in
+                guard let self,
+                      let current = self.currentURL?.standardizedFileURL,
+                      dirs.contains(current) else { return }
+                await self.loadItems(preservingSelection: self.selectedIDs)
+            }
+        }
     }
 
     /// 폴더가 바뀔 때 그 폴더에 기억된 보기 모드로 전환 — 기록이 없으면 자세히
@@ -490,6 +515,19 @@ final class TabViewModel: Identifiable {
                                       url: accumulated))
         }
         return result
+    }
+}
+
+// MARK: - 알림 구독 수명 관리
+
+/// NotificationCenter 블록 구독 토큰을 담아 두는 상자.
+///
+/// 소유자가 사라지면 이 상자도 함께 풀리며 deinit에서 구독을 해지한다.
+/// @MainActor 클래스는 deinit이 nonisolated라 격리된 프로퍼티를 만질 수 없어서 한 겹 둔다.
+final class NotificationObserverBox: @unchecked Sendable {
+    var token: (any NSObjectProtocol)?
+    deinit {
+        if let token { NotificationCenter.default.removeObserver(token) }
     }
 }
 

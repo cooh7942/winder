@@ -10,6 +10,9 @@ struct WinderApp: App {
         // ⌘N(새 창) / ⌘W(창 닫기)는 SwiftUI/AppKit 기본 동작으로 처리
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1100, height: 700)
-        .commands { NavigationCommands() }
+        .commands {
+            EditCommands()
+            NavigationCommands()
+        }
     }
 }

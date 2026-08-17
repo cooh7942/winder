@@ -193,6 +193,8 @@ struct FileListContainerView: View {
                 // 이름 변경 텍스트 필드 커밋
                 Task { await tab.renameItem(item, to: newName) }
             }
+        case .renameCancelled:
+            tab.renamingItemID = nil
         case .createFolder:
             Task { await tab.createFolder() }
         case .createTextFile:

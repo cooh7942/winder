@@ -13,10 +13,20 @@ struct OperationProgress: Sendable {
     var isComplete: Bool { current >= total }
 }
 
+extension Notification.Name {
+    /// Winder가 스스로 폴더 내용을 바꿨다 —
+    /// userInfo[FileOperationService.changedDirectoriesKey]에 바뀐 폴더 URL이 Set<URL>로 들어 있다
+    static let winderDirectoriesDidChange = Notification.Name("com.tjuxta.winder.directoriesDidChange")
+}
+
 /// 파일 I/O 래퍼 — FileManager를 Task.detached에서 실행하여 메인 스레드 블로킹 방지
 @MainActor
 final class FileOperationService {
     static let shared = FileOperationService()
+
+    /// winderDirectoriesDidChange의 userInfo 키
+    /// (알림은 어느 격리 문맥에서든 읽으므로 nonisolated)
+    nonisolated static let changedDirectoriesKey = "directories"
 
     // MARK: - 이름 바꾸기
 
@@ -28,6 +38,7 @@ final class FileOperationService {
         try await Task.detached(priority: .userInitiated) {
             try FileManager.default.moveItem(at: src, to: dst)
         }.value
+        announceChange(to: [src.deletingLastPathComponent()])
         return dst
     }
 
@@ -38,6 +49,7 @@ final class FileOperationService {
     @discardableResult
     func trash(items: [FileItem]) async throws -> [URL] {
         let urls = items.map(\.url)
+        defer { announceChange(to: urls.map { $0.deletingLastPathComponent() }) }
         return try await Task.detached(priority: .userInitiated) {
             var results: [URL] = []
             for url in urls {
@@ -56,6 +68,7 @@ final class FileOperationService {
         try await Task.detached(priority: .userInitiated) {
             try FileManager.default.createDirectory(at: target, withIntermediateDirectories: false)
         }.value
+        announceChange(to: [directory])
         return target
     }
 
@@ -64,6 +77,7 @@ final class FileOperationService {
         try await Task.detached(priority: .userInitiated) {
             try "".write(to: target, atomically: true, encoding: .utf8)
         }.value
+        announceChange(to: [directory])
         return target
     }
 
@@ -92,6 +106,7 @@ final class FileOperationService {
             created.append(target)
             progressHandler?(OperationProgress(current: index + 1, total: total, fileName: srcName))
         }
+        announceChange(to: [destination])
         return created
     }
 
@@ -123,6 +138,9 @@ final class FileOperationService {
         }
         guard !toMove.isEmpty else { return [] }
 
+        // 받는 폴더와 보낸 폴더가 모두 바뀐다 — 창을 나눠 쓸 때 양쪽 다 다시 읽혀야 한다
+        defer { announceChange(to: [dst] + toMove.map { $0.deletingLastPathComponent() }) }
+
         return try await Task.detached(priority: .userInitiated) {
             var moved: [(from: URL, to: URL)] = []
             for src in toMove {
@@ -140,6 +158,23 @@ final class FileOperationService {
             }
             return moved
         }.value
+    }
+
+    // MARK: - 변경 알림
+
+    /// 내용이 바뀐 폴더를 열려 있는 창들에 알린다.
+    ///
+    /// FileWatcher는 kFSEventStreamCreateFlagIgnoreSelf로 Winder 자신이 만든 변경을 무시한다 —
+    /// 그래서 알려 주지 않으면 다른 앱이 그 폴더를 건드릴 때까지 목록이 낡은 채로 남는다
+    /// (파일을 끌어다 놓았는데 상대 창에 나타나지 않던 문제)
+    private func announceChange(to directories: [URL]) {
+        let dirs = Set(directories.map(\.standardizedFileURL))
+        guard !dirs.isEmpty else { return }
+        NotificationCenter.default.post(
+            name: .winderDirectoriesDidChange,
+            object: nil,
+            userInfo: [Self.changedDirectoriesKey: dirs]
+        )
     }
 
     // MARK: - Private

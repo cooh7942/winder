@@ -14,6 +14,10 @@ final class ClipboardService {
     /// 붙여넣기 가능 여부 — NSPasteboard.changeCount 폴링으로 갱신 (@Observable 추적 가능)
     private(set) var hasPasteContent: Bool = false
 
+    /// 클립보드에 무엇이든 들어 있는지.
+    /// 터미널은 글자도 붙여넣으므로 파일 URL만 보는 hasPasteContent로는 편집 메뉴를 켤 수 없다
+    private(set) var hasAnyContent: Bool = false
+
     private var lastChangeCount: Int = 0
     private var pollTimer: Timer?
 
@@ -22,6 +26,7 @@ final class ClipboardService {
     private init() {
         lastChangeCount = NSPasteboard.general.changeCount
         hasPasteContent = NSPasteboard.general.canReadObject(forClasses: [NSURL.self], options: nil)
+        hasAnyContent = !(NSPasteboard.general.types ?? []).isEmpty
         // 0.5초마다 클립보드 변경 감지 (버튼 활성화 상태 갱신)
         pollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in self?.checkPasteboardChanges() }
@@ -35,6 +40,7 @@ final class ClipboardService {
         write(urls: items.map(\.url))
         lastChangeCount = NSPasteboard.general.changeCount  // 우리가 쓴 것임을 기록
         hasPasteContent = true
+        hasAnyContent = true
     }
 
     // MARK: - 잘라내기
@@ -46,6 +52,7 @@ final class ClipboardService {
         items.forEach { $0.isCutPending = true }
         lastChangeCount = NSPasteboard.general.changeCount  // 우리가 쓴 것임을 기록
         hasPasteContent = true
+        hasAnyContent = true
     }
 
     // MARK: - 붙여넣기
@@ -73,6 +80,7 @@ final class ClipboardService {
         guard current != lastChangeCount else { return }
         lastChangeCount = current
         hasPasteContent = NSPasteboard.general.canReadObject(forClasses: [NSURL.self], options: nil)
+        hasAnyContent = !(NSPasteboard.general.types ?? []).isEmpty
         // 다른 앱이 클립보드를 덮어쓰면 잘라내기 대기 상태 해제
         if !cutItems.isEmpty { clearCutState() }
     }
