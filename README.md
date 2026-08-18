@@ -4,7 +4,7 @@ A macOS file manager with a built‑in terminal and side‑by‑side folder pane
 
 내장 터미널과 좌우 2분할 창을 갖춘 macOS 파일 관리자입니다.
 
-> **Requires macOS 26.5 or later.** / **macOS 26.5 이상 필요.**
+> **Requires macOS 26 or later.** / **macOS 26 이상 필요.**
 
 ---
 
@@ -89,7 +89,8 @@ Being upfront so you are not hunting for them:
 
 ### Build
 
-Requires Xcode with the macOS 26.5 SDK.
+Requires Xcode with the macOS 26.5 SDK. (Built against 26.5, deployed to 26.0 —
+the app uses no API newer than macOS 26.0.)
 
 ```bash
 xcodebuild -project winder.xcodeproj -scheme winder -configuration Debug build
@@ -213,7 +214,8 @@ Finder를 쓰던 분이 유일하게 놀랄 지점입니다. 실수로 끌었을
 
 ### 빌드
 
-macOS 26.5 SDK가 있는 Xcode가 필요합니다.
+macOS 26.5 SDK가 있는 Xcode가 필요합니다. (26.5 SDK로 빌드하고 배포 대상은 26.0입니다 —
+macOS 26.0보다 새로운 API는 쓰지 않습니다.)
 
 ```bash
 xcodebuild -project winder.xcodeproj -scheme winder -configuration Debug build
