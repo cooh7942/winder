@@ -10,6 +10,8 @@ struct GalleryView: View {
     let items: [FileItem]
     /// 목록 갱신 감지용 — 폴더가 바뀌면 미리보기 대상을 첫 항목으로 되돌린다
     let contentVersion: Int
+    /// 인라인 이름 변경 중인 항목 — 큰 미리보기 아래 이름 자리에서 편집한다
+    let renamingItemID: String?
     @Binding var selectedIDs: Set<String>
     let favoriteURLs: Set<URL>
     /// 현재 폴더 — 빈 곳에 끌어다 놓으면 여기로 들어온다
@@ -43,9 +45,21 @@ struct GalleryView: View {
         .focusable()
         .focusEffectDisabled()
         .focused($isFocused)
-        .onKeyPress(.leftArrow)  { step(-1); return .handled }
-        .onKeyPress(.rightArrow) { step(1);  return .handled }
-        .onKeyPress(.return)     { if let current { onOpen(current) }; return .handled }
+        // 이름 편집 칸이 포커스를 가진 동안에도 이 처리기가 먼저 불린다 —
+        // 넘기지 않으면 Enter가 확정 대신 폴더 열기가 되고 화살표가 커서를 못 옮긴다
+        .onKeyPress(.leftArrow) {
+            guard renamingItemID == nil else { return .ignored }
+            step(-1); return .handled
+        }
+        .onKeyPress(.rightArrow) {
+            guard renamingItemID == nil else { return .ignored }
+            step(1); return .handled
+        }
+        .onKeyPress(.return) {
+            guard renamingItemID == nil else { return .ignored }
+            if let current { onOpen(current) }
+            return .handled
+        }
         .contextMenu { emptyAreaContextMenu(onAction: onAction) }
         // 끌어다 놓으면 현재 폴더로
         .dropDestination(for: URL.self) { urls, _ in
@@ -70,13 +84,19 @@ struct GalleryView: View {
             // Set은 순서가 없다 — 목록에 놓인 순서로 첫 번째를 고른다
             currentID = items.first { ids.contains($0.id) }?.id ?? currentID
         }
+        // 이름을 바꿀 항목을 큰 미리보기로 띄운다 — 편집 칸이 그 아래에 있다
+        .onChange(of: renamingItemID) { _, id in
+            if let id { currentID = id }
+        }
     }
 
     // MARK: - 큰 미리보기
 
     @ViewBuilder private var preview: some View {
         if let current {
-            GalleryPreview(item: current)
+            GalleryPreview(item: current,
+                           isRenaming: renamingItemID == current.id,
+                           onAction: onAction)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             Color.clear.frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -132,6 +152,7 @@ struct GalleryView: View {
 
     private func handleTap(_ item: FileItem) {
         guard let index = items.firstIndex(where: { $0.id == item.id }) else { return }
+        endInlineRenameIfNeeded(renamingItemID)
         let mods = NSEvent.modifierFlags
         if mods.contains(.command) {
             if selectedIDs.contains(item.id) {
@@ -167,6 +188,8 @@ struct GalleryView: View {
 
 private struct GalleryPreview: View {
     let item: FileItem
+    let isRenaming: Bool
+    let onAction: (DetailsAction) -> Void
 
     @State private var image: NSImage?
     /// 로딩 중(스피너)과 미리보기 없음(아이콘 대체)을 구분한다
@@ -179,10 +202,16 @@ private struct GalleryPreview: View {
                 .opacity(item.isCutPending ? 0.5 : 1.0)
 
             VStack(spacing: 2) {
-                Text(item.displayName)
-                    .fluentBody()
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                if isRenaming {
+                    InlineRenameField(item: item, fontSize: 13, alignment: .center,
+                                      onAction: onAction)
+                        .frame(maxWidth: 320)
+                } else {
+                    Text(item.displayName)
+                        .fluentBody()
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
                 Text(subtitle)
                     .fluentCaption()
                     .foregroundColor(.fluentTextSecondary)

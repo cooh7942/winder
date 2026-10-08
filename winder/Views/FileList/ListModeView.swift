@@ -5,6 +5,8 @@ import AppKit
 /// 항목이 세로로 채워진 후 다음 열로 넘어가는 Windows 11 목록 모드와 동일한 레이아웃
 struct ListModeView: View {
     let items: [FileItem]
+    /// 인라인 이름 변경 중인 항목 — 새 폴더를 만들면 바로 이 상태로 들어온다
+    let renamingItemID: String?
     @Binding var selectedIDs: Set<String>
     let favoriteURLs: Set<URL>
     /// 현재 폴더 — 빈 곳에 드롭했을 때의 대상
@@ -27,42 +29,51 @@ struct ListModeView: View {
             let numRows = max(1, Int(geo.size.height / rowHeight))
             let rows = Array(repeating: GridItem(.fixed(rowHeight), spacing: 0), count: numRows)
 
-            ScrollView(.horizontal, showsIndicators: true) {
-                LazyHGrid(rows: rows, alignment: .top, spacing: 0) {
-                    ForEach(Array(items.enumerated()), id: \.element.id) { idx, item in
-                        ListModeCell(
-                            item: item,
-                            isSelected: selectedIDs.contains(item.id),
-                            isHovered: hoveredID == item.id,
-                            isDropTarget: dropTargetID == item.id
-                        )
-                        .frame(width: cellWidth, height: rowHeight)
-                        .onTapGesture(count: 2) { onOpen(item) }
-                        .onTapGesture { handleTap(item: item, index: idx) }
-                        .onHover { hoveredID = $0 ? item.id : nil }
-                        // Finder처럼 끌어서 복사 — 자세히 보기와 동작을 맞춘다
-                        .onDrag { NSItemProvider(object: item.url as NSURL) }
-                        .dropDestination(for: URL.self) { urls, _ in
-                            handleFileListDrop(urls, into: fileListDropDestination(for: item),
-                                               onAction: onAction)
-                        } isTargeted: { targeted in
-                            if targeted, fileListDropDestination(for: item) != nil {
-                                dropTargetID = item.id
-                            } else if dropTargetID == item.id {
-                                dropTargetID = nil
-                            }
-                        }
-                        .contextMenu {
-                            fileItemContextMenu(
-                                for: item,
-                                isMulti: selectedIDs.count > 1 && selectedIDs.contains(item.id),
-                                favoriteURLs: favoriteURLs,
+            ScrollViewReader { proxy in
+                ScrollView(.horizontal, showsIndicators: true) {
+                    LazyHGrid(rows: rows, alignment: .top, spacing: 0) {
+                        ForEach(Array(items.enumerated()), id: \.element.id) { idx, item in
+                            ListModeCell(
+                                item: item,
+                                isSelected: selectedIDs.contains(item.id),
+                                isHovered: hoveredID == item.id,
+                                isDropTarget: dropTargetID == item.id,
+                                isRenaming: renamingItemID == item.id,
                                 onAction: onAction
                             )
+                            .frame(width: cellWidth, height: rowHeight)
+                            .onTapGesture(count: 2) { onOpen(item) }
+                            .onTapGesture { handleTap(item: item, index: idx) }
+                            .onHover { hoveredID = $0 ? item.id : nil }
+                            // Finder처럼 끌어서 복사 — 자세히 보기와 동작을 맞춘다
+                            .onDrag { NSItemProvider(object: item.url as NSURL) }
+                            .dropDestination(for: URL.self) { urls, _ in
+                                handleFileListDrop(urls, into: fileListDropDestination(for: item),
+                                                   onAction: onAction)
+                            } isTargeted: { targeted in
+                                if targeted, fileListDropDestination(for: item) != nil {
+                                    dropTargetID = item.id
+                                } else if dropTargetID == item.id {
+                                    dropTargetID = nil
+                                }
+                            }
+                            .contextMenu {
+                                fileItemContextMenu(
+                                    for: item,
+                                    isMulti: selectedIDs.count > 1 && selectedIDs.contains(item.id),
+                                    favoriteURLs: favoriteURLs,
+                                    onAction: onAction
+                                )
+                            }
                         }
                     }
+                    .padding(.horizontal, FluentMetrics.paddingXS)
                 }
-                .padding(.horizontal, FluentMetrics.paddingXS)
+                // 이름을 바꿀 항목이 화면 밖이면 칸이 만들어지지 않는다 — 먼저 보이게 한다
+                .onChange(of: renamingItemID) { _, id in
+                    guard let id else { return }
+                    proxy.scrollTo(id)
+                }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -81,6 +92,7 @@ struct ListModeView: View {
     }
 
     private func handleTap(item: FileItem, index: Int) {
+        endInlineRenameIfNeeded(renamingItemID)
         let mods = NSEvent.modifierFlags
         if mods.contains(.command) {
             if selectedIDs.contains(item.id) { selectedIDs.remove(item.id) }
@@ -102,6 +114,8 @@ private struct ListModeCell: View {
     let isSelected: Bool
     let isHovered: Bool
     let isDropTarget: Bool
+    let isRenaming: Bool
+    let onAction: (DetailsAction) -> Void
 
     @State private var icon: NSImage? = nil
 
@@ -118,10 +132,14 @@ private struct ListModeCell: View {
             .frame(width: 16, height: 16)
             .opacity(item.isCutPending ? 0.5 : 1.0)
 
-            Text(item.displayName)
-                .font(.system(size: 12))
-                .lineLimit(1)
-                .truncationMode(.tail)
+            if isRenaming {
+                InlineRenameField(item: item, fontSize: 12, onAction: onAction)
+            } else {
+                Text(item.displayName)
+                    .font(.system(size: 12))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
 
             Spacer(minLength: 0)
         }

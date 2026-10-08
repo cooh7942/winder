@@ -33,6 +33,10 @@ enum FluentIcons {
     static let network    = "network"
     static let trash      = "trash"
 
+    // MARK: - 파일 작업 진행 패널
+    static let transferCopy = "doc.on.doc"
+    static let transferMove = "arrow.right.doc.on.clipboard"
+
     // MARK: - 일반 UI
     static let close     = "xmark"
     static let checkmark = "checkmark"

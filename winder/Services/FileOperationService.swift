@@ -1,18 +1,6 @@
 import Foundation
 import AppKit
 
-// MARK: - OperationProgress
-
-/// 복사/이동 작업 진행 상태 — 100개 이상 항목 복사 시 진행 다이얼로그에 표시
-struct OperationProgress: Sendable {
-    let current: Int
-    let total: Int
-    let fileName: String
-
-    var fraction: Double { total > 0 ? Double(current) / Double(total) : 0 }
-    var isComplete: Bool { current >= total }
-}
-
 extension Notification.Name {
     /// Winder가 스스로 폴더 내용을 바꿨다 —
     /// userInfo[FileOperationService.changedDirectoriesKey]에 바뀐 폴더 URL이 Set<URL>로 들어 있다
@@ -33,13 +21,31 @@ final class FileOperationService {
     /// 파일/폴더 이름 변경
     /// - Returns: 변경 후 URL
     func rename(item: FileItem, to newName: String) async throws -> URL {
-        let dst = item.url.deletingLastPathComponent().appendingPathComponent(newName)
-        let src = item.url
+        try await rename(at: item.url, to: newName)
+    }
+
+    /// URL로 이름 변경 — 탐색 창 트리처럼 FileItem이 없는 곳에서 쓴다
+    /// - Returns: 변경 후 URL
+    func rename(at src: URL, to newName: String) async throws -> URL {
+        let dst = src.deletingLastPathComponent().appendingPathComponent(newName)
         try await Task.detached(priority: .userInitiated) {
             try FileManager.default.moveItem(at: src, to: dst)
         }.value
         announceChange(to: [src.deletingLastPathComponent()])
         return dst
+    }
+
+    /// 새 이름으로 쓸 수 없는 이유 — 쓸 수 있으면 nil.
+    /// 같은 이름이 이미 있는지는 부르는 쪽이 판단한다 (목록에서 대소문자 무시 비교 등)
+    nonisolated static func invalidNameReason(_ name: String) -> String? {
+        if name.contains("/") || name.contains(":") {
+            return "파일 이름에 '/' 또는 ':'를 사용할 수 없습니다."
+        }
+        // 255바이트 제한 (대부분 파일 시스템 공통 제한)
+        if name.utf8.count > 255 {
+            return "파일 이름이 너무 깁니다. (최대 255바이트)"
+        }
+        return nil
     }
 
     // MARK: - 삭제 (휴지통)
@@ -83,31 +89,36 @@ final class FileOperationService {
 
     // MARK: - 복사
 
-    /// 파일/폴더 복사
-    /// - Parameters:
-    ///   - progress: 각 파일 복사 완료 후 메인 액터에서 호출되는 진행률 핸들러 (100+ 항목 시 진행 다이얼로그용)
-    /// - Returns: 실제로 생성된 URL 배열 — uniqueURL로 이름이 바뀔 수 있으므로 undo는 반드시 이 값을 사용
+    /// 파일/폴더 복사 — 진행 상황은 FileTransferCenter에 올라가 창 아래 패널에 보인다
+    /// - Returns: 실제로 생성된 URL 배열 — uniqueURL로 이름이 바뀔 수 있으므로 undo는 반드시 이 값을 사용.
+    ///   사용자가 취소하면 그때까지 끝난 항목만 돌려준다 (만들다 만 항목은 지운다)
     @discardableResult
-    func copyItems(
-        _ urls: [URL],
-        to destination: URL,
-        progress progressHandler: (@MainActor (OperationProgress) -> Void)? = nil
-    ) async throws -> [URL] {
-        let dst = destination
-        let total = urls.count
-        var created: [URL] = []
-        for (index, src) in urls.enumerated() {
-            let srcName = src.lastPathComponent
-            let target: URL = try await Task.detached(priority: .userInitiated) {
-                let t = FileOperationService.uniqueURL(in: dst, name: srcName)
-                try FileManager.default.copyItem(at: src, to: t)
-                return t
-            }.value
-            created.append(target)
-            progressHandler?(OperationProgress(current: index + 1, total: total, fileName: srcName))
+    func copyItems(_ urls: [URL], to destination: URL) async throws -> [URL] {
+        guard !urls.isEmpty else { return [] }
+        let transfer = FileTransferCenter.shared.begin(.copy, items: urls, destination: destination)
+        defer {
+            FileTransferCenter.shared.end(transfer)
+            announceChange(to: [destination])
         }
-        announceChange(to: [destination])
-        return created
+        let counter = transfer.counter
+        let dst = destination
+        return try await Task.detached(priority: .userInitiated) {
+            var created: [URL] = []
+            do {
+                let sizes = try FileCopyEngine.sizes(of: urls, counter: counter)
+                counter.setTotal(sizes.reduce(0, +))
+                for (src, size) in zip(urls, sizes) {
+                    if counter.isCancelled { throw FileCopyEngine.Cancelled() }
+                    let target = FileOperationService.uniqueURL(in: dst, name: src.lastPathComponent)
+                    try FileCopyEngine.copy(src, to: target, counter: counter)
+                    counter.finishItem(size: size)
+                    created.append(target)
+                }
+            } catch is FileCopyEngine.Cancelled {
+                // 취소는 오류가 아니다 — 끝난 항목까지만 반영한다
+            }
+            return created
+        }.value
     }
 
     // MARK: - 이동 (잘라내기+붙여넣기)
@@ -115,7 +126,9 @@ final class FileOperationService {
     /// 파일/폴더 이동
     /// - Returns: (원본 URL, 이동 후 실제 URL) 쌍 배열 — undo는 반드시 이 값을 사용
     /// - 같은 위치로의 이동은 해당 항목을 건너뜀 (빈 배열 반환 시 undo 불필요)
-    /// - 부분 실패 시 이미 이동된 항목을 역순 롤백
+    /// - 같은 볼륨 안은 이름만 바꾸므로 즉시 끝난다. 다른 볼륨으로는 복사한 뒤 원본을 지우며,
+    ///   이때 진행 상황이 창 아래 패널에 보인다
+    /// - 오류가 나면 이미 이동된 항목을 역순 롤백, 사용자가 취소하면 끝난 항목은 그대로 둔다
     @discardableResult
     func moveItems(_ urls: [URL], to destination: URL) async throws -> [(from: URL, to: URL)] {
         let dst = destination.standardizedFileURL
@@ -138,26 +151,59 @@ final class FileOperationService {
         }
         guard !toMove.isEmpty else { return [] }
 
+        let transfer = FileTransferCenter.shared.begin(.move, items: toMove, destination: dst)
         // 받는 폴더와 보낸 폴더가 모두 바뀐다 — 창을 나눠 쓸 때 양쪽 다 다시 읽혀야 한다
-        defer { announceChange(to: [dst] + toMove.map { $0.deletingLastPathComponent() }) }
+        defer {
+            FileTransferCenter.shared.end(transfer)
+            announceChange(to: [dst] + toMove.map { $0.deletingLastPathComponent() })
+        }
+        let counter = transfer.counter
 
         return try await Task.detached(priority: .userInitiated) {
+            let fm = FileManager.default
+            let crossVolume = toMove.map { !FileOperationService.isSameVolume($0, dst) }
+            // 다른 볼륨으로 가는 것만 실제로 데이터를 옮긴다 — 진행률도 그 크기만 센다
+            var sizes = Array(repeating: Int64(0), count: toMove.count)
             var moved: [(from: URL, to: URL)] = []
-            for src in toMove {
-                let target = FileOperationService.uniqueURL(in: dst, name: src.lastPathComponent)
-                do {
-                    try FileManager.default.moveItem(at: src, to: target)
-                    moved.append((from: src, to: target))
-                } catch {
-                    // 부분 이동 롤백 — 이미 이동된 항목을 역순으로 원위치
-                    for pair in moved.reversed() {
-                        try? FileManager.default.moveItem(at: pair.to, to: pair.from)
+            do {
+                let crossing = zip(toMove, crossVolume).filter(\.1).map(\.0)
+                let crossingSizes = try FileCopyEngine.sizes(of: crossing, counter: counter)
+                var next = crossingSizes.makeIterator()
+                for i in toMove.indices where crossVolume[i] { sizes[i] = next.next() ?? 0 }
+                counter.setTotal(crossingSizes.reduce(0, +))
+
+                for (i, src) in toMove.enumerated() {
+                    if counter.isCancelled { throw FileCopyEngine.Cancelled() }
+                    let target = FileOperationService.uniqueURL(in: dst, name: src.lastPathComponent)
+                    if crossVolume[i] {
+                        try FileCopyEngine.copy(src, to: target, counter: counter)
+                        try fm.removeItem(at: src)
+                        counter.finishItem(size: sizes[i])
+                    } else {
+                        try fm.moveItem(at: src, to: target)
                     }
-                    throw error
+                    moved.append((from: src, to: target))
                 }
+            } catch is FileCopyEngine.Cancelled {
+                // 취소는 오류가 아니다 — 끝난 항목은 옮겨진 채로 둔다
+            } catch {
+                // 부분 이동 롤백 — 이미 이동된 항목을 역순으로 원위치
+                for pair in moved.reversed() {
+                    try? fm.moveItem(at: pair.to, to: pair.from)
+                }
+                throw error
             }
             return moved
         }.value
+    }
+
+    /// 두 위치가 같은 볼륨인지 — 같으면 이동이 이름 바꾸기로 끝난다
+    nonisolated private static func isSameVolume(_ a: URL, _ b: URL) -> Bool {
+        let key: Set<URLResourceKey> = [.volumeIdentifierKey]
+        guard let va = try? a.resourceValues(forKeys: key).volumeIdentifier as? NSObject,
+              let vb = try? b.resourceValues(forKeys: key).volumeIdentifier as? NSObject
+        else { return false }
+        return va.isEqual(vb)
     }
 
     // MARK: - 변경 알림
@@ -167,7 +213,8 @@ final class FileOperationService {
     /// FileWatcher는 kFSEventStreamCreateFlagIgnoreSelf로 Winder 자신이 만든 변경을 무시한다 —
     /// 그래서 알려 주지 않으면 다른 앱이 그 폴더를 건드릴 때까지 목록이 낡은 채로 남는다
     /// (파일을 끌어다 놓았는데 상대 창에 나타나지 않던 문제)
-    private func announceChange(to directories: [URL]) {
+    /// 되돌리기처럼 이 서비스를 거치지 않고 FileManager를 직접 쓰는 곳도 이걸로 알린다
+    func announceChange(to directories: [URL]) {
         let dirs = Set(directories.map(\.standardizedFileURL))
         guard !dirs.isEmpty else { return }
         NotificationCenter.default.post(

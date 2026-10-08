@@ -39,6 +39,10 @@ struct ExplorerWindow: View {
                 filePanes
             }
         }
+        // 복사·이동 진행 — 카드 영역만 차지하므로 나머지 화면 클릭은 그대로 통과한다
+        .overlay(alignment: .bottomTrailing) {
+            TransferProgressPanel()
+        }
         // 최소 크기를 주지 않으면 창이 콘텐츠 최소치까지 쪼그라든다
         .frame(minWidth: 900, minHeight: 560)
         .background(WindowAccessor())

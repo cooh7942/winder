@@ -66,10 +66,6 @@ final class TabViewModel: Identifiable {
     var confirmingPermanentDelete: Bool = false
     /// 현재 인라인 이름 변경 중인 항목 ID — DetailsView가 rename 모드 진입에 사용
     var renamingItemID: String? = nil
-    /// 붙여넣기/복사 진행 중 여부 (100+ 항목 시 진행 시트 표시)
-    var isPasteInProgress: Bool = false
-    /// 붙여넣기 진행률 (isPasteInProgress == true 일 때 유효)
-    var pasteProgress: OperationProgress? = nil
 
     // MARK: - FSEvents 감시
     private var fileWatcher: FileWatcher?
@@ -119,7 +115,7 @@ final class TabViewModel: Identifiable {
                 guard let self,
                       let current = self.currentURL?.standardizedFileURL,
                       dirs.contains(current) else { return }
-                await self.loadItems(preservingSelection: self.selectedIDs)
+                await self.reloadKeepingSelection()
             }
         }
     }
@@ -230,15 +226,9 @@ final class TabViewModel: Identifiable {
             renamingItemID = nil
             return
         }
-        // 유효성 검사: 파일 이름에 금지된 문자
-        guard !trimmed.contains("/"), !trimmed.contains(":") else {
-            errorMessage = "파일 이름에 '/' 또는 ':'를 사용할 수 없습니다."
-            renamingItemID = nil
-            return
-        }
-        // 255바이트 제한 (대부분 파일 시스템 공통 제한)
-        guard trimmed.utf8.count <= 255 else {
-            errorMessage = "파일 이름이 너무 깁니다. (최대 255바이트)"
+        // 유효성 검사: 금지 문자·길이 (탐색 창 트리와 같은 규칙)
+        if let reason = FileOperationService.invalidNameReason(trimmed) {
+            errorMessage = reason
             renamingItemID = nil
             return
         }
@@ -253,7 +243,8 @@ final class TabViewModel: Identifiable {
         let oldURL = item.url
         do {
             let newURL = try await FileOperationService.shared.rename(item: item, to: trimmed)
-            UndoService.shared.push(.init(description: "이름 바꾸기") {
+            UndoService.shared.push(.init(description: "이름 바꾸기",
+                                          affectedDirectories: [oldURL.deletingLastPathComponent()]) {
                 try FileManager.default.moveItem(at: newURL, to: oldURL)
             })
             await loadItems(preservingSelection: [newURL.path])
@@ -272,7 +263,8 @@ final class TabViewModel: Identifiable {
             let originalURLs = targets.map(\.url)
             // moveItem으로 휴지통에서 원위치 복원 가능
             if !trashedURLs.isEmpty {
-                UndoService.shared.push(.init(description: "삭제") {
+                UndoService.shared.push(.init(description: "삭제",
+                                              affectedDirectories: originalURLs.map { $0.deletingLastPathComponent() }) {
                     try await Task.detached(priority: .userInitiated) {
                         for (trashURL, origURL) in zip(trashedURLs, originalURLs) {
                             try FileManager.default.moveItem(at: trashURL, to: origURL)
@@ -311,7 +303,7 @@ final class TabViewModel: Identifiable {
         guard let url = currentURL else { return }
         do {
             let folderURL = try await FileOperationService.shared.createFolder(in: url)
-            UndoService.shared.push(.init(description: "새 폴더") {
+            UndoService.shared.push(.init(description: "새 폴더", affectedDirectories: [url]) {
                 try FileManager.default.removeItem(at: folderURL)
             })
             await loadItems()
@@ -327,7 +319,7 @@ final class TabViewModel: Identifiable {
         guard let url = currentURL else { return }
         do {
             let fileURL = try await FileOperationService.shared.createTextFile(in: url)
-            UndoService.shared.push(.init(description: "새 파일") {
+            UndoService.shared.push(.init(description: "새 파일", affectedDirectories: [url]) {
                 try FileManager.default.removeItem(at: fileURL)
             })
             await loadItems()
@@ -360,7 +352,8 @@ final class TabViewModel: Identifiable {
                 let moved = try await FileOperationService.shared.moveItems(srcURLs, to: url)
                 clipboard.clearCutState()
                 if !moved.isEmpty {
-                    UndoService.shared.push(.init(description: "이동") {
+                    UndoService.shared.push(.init(description: "이동",
+                                                  affectedDirectories: [url] + moved.map { $0.from.deletingLastPathComponent() }) {
                         // 실제 이동된 URL(pair.to)을 원위치(pair.from)로 되돌림
                         try await Task.detached(priority: .userInitiated) {
                             for pair in moved.reversed() {
@@ -370,29 +363,21 @@ final class TabViewModel: Identifiable {
                     })
                 }
             } else {
-                // 복사 — 100개 이상 항목은 진행 시트 표시
-                let showProgress = urls.count >= 100
-                if showProgress {
-                    isPasteInProgress = true
-                    pasteProgress = OperationProgress(current: 0, total: urls.count, fileName: "")
-                }
-                defer {
-                    isPasteInProgress = false
-                    pasteProgress = nil
-                }
-                // copyItems가 반환한 실제 생성 URL만 undo 대상으로 삼음
+                // 복사 — 진행 상황은 FileOperationService가 창 아래 진행 패널에 올린다.
+                // copyItems가 반환한 실제 생성 URL만 undo 대상으로 삼음 (취소하면 끝난 항목만 온다)
                 // removeItem 대신 trashItem: 기존 파일을 실수로 지우는 사고 방지
-                let created = try await FileOperationService.shared.copyItems(urls, to: url) { [weak self] p in
-                    self?.pasteProgress = p
+                let created = try await FileOperationService.shared.copyItems(urls, to: url)
+                // 시작하자마자 취소하면 만든 것이 없다
+                if !created.isEmpty {
+                    UndoService.shared.push(.init(description: "복사", affectedDirectories: [url]) {
+                        // trashItem 실패는 개별적으로 무시하므로 detached Task 자체는 throw하지 않는다
+                        await Task.detached(priority: .userInitiated) {
+                            for createdURL in created {
+                                try? FileManager.default.trashItem(at: createdURL, resultingItemURL: nil)
+                            }
+                        }.value
+                    })
                 }
-                UndoService.shared.push(.init(description: "복사") {
-                    // trashItem 실패는 개별적으로 무시하므로 detached Task 자체는 throw하지 않는다
-                    await Task.detached(priority: .userInitiated) {
-                        for createdURL in created {
-                            try? FileManager.default.trashItem(at: createdURL, resultingItemURL: nil)
-                        }
-                    }.value
-                })
             }
             await loadItems()
         } catch {
@@ -432,8 +417,7 @@ final class TabViewModel: Identifiable {
         fileWatcher = watcher
         watcherTask = Task {
             for await _ in watcher.watch(url: url) {
-                let preserved = selectedIDs
-                await loadItems(preservingSelection: preserved)
+                await reloadKeepingSelection()
             }
         }
     }
@@ -448,6 +432,18 @@ final class TabViewModel: Identifiable {
     }
 
     // MARK: - Private
+
+    /// 바깥에서 생긴 변경으로 다시 읽기 — 선택은 읽기가 끝난 시점의 것을 유지한다.
+    ///
+    /// 시작할 때의 선택을 넘겨 두면, 읽는 사이 다른 작업이 바꾼 선택을 옛것으로 덮어쓴다.
+    /// 새 폴더를 만들면 그 변경 알림으로 이 읽기가 함께 돌기 때문에,
+    /// 방금 선택한 새 폴더가 곧바로 선택 해제되던 원인이었다
+    private func reloadKeepingSelection() async {
+        await loadItems()
+        let existing = Set(loadedItems.map(\.id))
+        let kept = selectedIDs.intersection(existing)
+        if kept != selectedIDs { selectedIDs = kept }
+    }
 
     func loadItems(preservingSelection: Set<String>? = nil) async {
         guard let url = currentURL else {
