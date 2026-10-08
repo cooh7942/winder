@@ -10,6 +10,9 @@ final class UndoService {
 
     struct Operation {
         let description: String
+        /// 되돌리면 내용이 바뀌는 폴더 — 되돌리기는 FileManager를 직접 쓰므로
+        /// 열려 있는 목록·탐색 창 트리에 따로 알려야 한다
+        var affectedDirectories: [URL] = []
         let undo: () async throws -> Void
     }
 
@@ -31,6 +34,7 @@ final class UndoService {
     func performUndo() async {
         guard let op = stack.popLast() else { return }
         try? await op.undo()
+        FileOperationService.shared.announceChange(to: op.affectedDirectories)
     }
 
     func clearAll() { stack.removeAll() }

@@ -28,7 +28,8 @@ enum DetailsAction {
     /// 즐겨찾기에서 제거 (기능 1)
     case removeFromFavorites(FileItem)
     /// 파일 목록으로 끌어다 놓기 — destination은 대상 폴더(빈 곳에 놓으면 현재 폴더)
-    case dropItems(urls: [URL], destination: URL, isCopy: Bool)
+    /// 끌어다 놓기 — 복사할지 이동할지는 놓은 뒤 메뉴로 묻는다 (performFileDrop)
+    case dropItems(urls: [URL], destination: URL)
 }
 
 // MARK: - DetailsView
@@ -150,6 +151,9 @@ struct DetailsView: NSViewRepresentable {
             if let id = renamingItemID,
                let row = items.firstIndex(where: { $0.id == id }) {
                 coord.beginRename(row: row)
+            } else if renamingItemID == nil {
+                // 다른 보기로 바뀌는 등 바깥에서 끝낸 경우 — 보이지 않는 칸에 포커스가 남지 않게 닫는다
+                coord.cancelRenaming()
             }
         }
 
@@ -197,6 +201,8 @@ final class DetailsViewCoordinator: NSObject,
     var items: [FileItem] = []
     var contentVersion: Int = -1
     var renamingItemID: String? = nil
+    /// 이름 변경 칸을 띄운 셀 — 바깥에서 이름 변경이 끝났을 때 닫으려고 기억한다
+    private weak var renamingCell: WinTableCellView?
     var sortDescriptor: FileSortDescriptor = FileSortDescriptor()
     /// 현재 즐겨찾기 URL 집합 — updateNSView가 매 렌더마다 동기화 (기능 1)
     var favoriteURLs: Set<URL> = []
@@ -289,8 +295,7 @@ final class DetailsViewCoordinator: NSObject,
             return false
         }
 
-        onAction(.dropItems(urls: urls, destination: destination,
-                            isCopy: info.draggingSourceOperationMask.contains(.copy)))
+        onAction(.dropItems(urls: urls, destination: destination))
         return true
     }
 
@@ -308,7 +313,7 @@ final class DetailsViewCoordinator: NSObject,
         }
     }
 
-    /// 그냥 끌면 복사, ⌘를 누르면 이동 — 트리 드롭과 동일
+    /// 커서 배지 표시용 — 실제 복사·이동은 놓은 뒤 메뉴에서 고른다
     private func dragOperation(for info: NSDraggingInfo) -> NSDragOperation {
         info.draggingSourceOperationMask.contains(.copy) ? .copy : .move
     }
@@ -425,7 +430,14 @@ final class DetailsViewCoordinator: NSObject,
             guard let cell = self.tableView.view(atColumn: nameColIdx, row: row,
                                                   makeIfNecessary: true) as? WinTableCellView else { return }
             cell.startRenaming(currentName: self.items[row].displayName)
+            self.renamingCell = cell
         }
+    }
+
+    /// 진행 중인 인라인 이름 변경을 확정하지 않고 닫는다
+    func cancelRenaming() {
+        renamingCell?.endRenaming(commit: false)
+        renamingCell = nil
     }
 
     // MARK: 키보드 이벤트 (WinTableView 위임)
@@ -883,6 +895,11 @@ final class WinTableCellView: NSTableCellView {
         tf.backgroundColor = .clear
         tf.focusRingType = .none
         tf.delegate = nil
+        // Esc로 끝내면 필드 편집기가 첫 응답자로 남아 키 입력(화살표·⌘Z)을 계속 가져간다 —
+        // 목록에 돌려준다. delegate를 먼저 끊었으므로 이 과정의 편집 종료 알림은 다시 오지 않는다
+        if let window = tf.window, let editor = tf.currentEditor(), window.firstResponder === editor {
+            window.makeFirstResponder(enclosingScrollView?.documentView)
+        }
         if commit, !newName.isEmpty, newName != originalName {
             onRenameCommit?(newName)
         } else {

@@ -92,5 +92,7 @@ enum FluentMetrics {
     static let iconSizeSmall:      CGFloat = 16
 
     // MARK: - 애니메이션 (초)
+    /// 복사·이동 진행 패널 카드 폭
+    static let transferPanelWidth: CGFloat = 340
     static let animStandard: Double = 0.15   // hover, 선택, 버튼 상태
 }

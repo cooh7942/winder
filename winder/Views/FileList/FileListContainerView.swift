@@ -29,7 +29,9 @@ struct FileListContainerView: View {
                 DetailsView(
                     items: tab.items,
                     contentVersion: tab.contentVersion,
-                    renamingItemID: tab.renamingItemID,
+                    // 숨어 있는 동안 이름 변경을 시작하면 보이지 않는 칸이 포커스를 가져간다 —
+                    // 다른 보기의 편집 칸이 입력을 받지 못하게 된다
+                    renamingItemID: isDetailsModeActive ? tab.renamingItemID : nil,
                     selectedIDs: bindable.selectedIDs,
                     sortDescriptor: tab.sortDescriptor,
                     favoriteURLs: favoriteURLs,
@@ -47,6 +49,7 @@ struct FileListContainerView: View {
                     IconsGridView(
                         items: tab.items,
                         iconSize: tab.viewMode.iconSize,
+                        renamingItemID: tab.renamingItemID,
                         selectedIDs: bindable.selectedIDs,
                         favoriteURLs: favoriteURLs,
                         currentURL: tab.currentURL,
@@ -60,6 +63,7 @@ struct FileListContainerView: View {
                     GalleryView(
                         items: tab.items,
                         contentVersion: tab.contentVersion,
+                        renamingItemID: tab.renamingItemID,
                         selectedIDs: bindable.selectedIDs,
                         favoriteURLs: favoriteURLs,
                         currentURL: tab.currentURL,
@@ -72,6 +76,7 @@ struct FileListContainerView: View {
                 if tab.viewMode == .list {
                     ListModeView(
                         items: tab.items,
+                        renamingItemID: tab.renamingItemID,
                         selectedIDs: bindable.selectedIDs,
                         favoriteURLs: favoriteURLs,
                         currentURL: tab.currentURL,
@@ -146,10 +151,6 @@ struct FileListContainerView: View {
         } message: {
             Text("선택한 항목이 영구적으로 삭제되며 복구할 수 없습니다.")
         }
-        // 복사 진행 시트 (100+ 항목)
-        .sheet(isPresented: .constant(tab.isPasteInProgress)) {
-            CopyProgressSheet(progress: tab.pasteProgress)
-        }
     }
 
     // MARK: - A-2: 전체 디스크 접근 권한 안내
@@ -219,15 +220,9 @@ struct FileListContainerView: View {
             try? FavoritesStore.shared.add(url: item.url)
         case .removeFromFavorites(let item):
             FavoritesStore.shared.removeByURL(item.url)
-        case .dropItems(let urls, let destination, let isCopy):
-            // 탐색 창 트리의 드롭과 같은 규칙 — 그냥 끌면 복사, ⌘를 누른 채면 이동
-            Task {
-                if isCopy {
-                    _ = try? await FileOperationService.shared.copyItems(urls, to: destination)
-                } else {
-                    _ = try? await FileOperationService.shared.moveItems(urls, to: destination)
-                }
-            }
+        case .dropItems(let urls, let destination):
+            // 복사할지 이동할지 놓은 자리에서 묻는다 — 탐색 창 트리의 드롭과 같은 흐름
+            performFileDrop(urls, into: destination)
         }
     }
 
@@ -257,42 +252,5 @@ struct FileListContainerView: View {
         case .largeIcons, .mediumIcons, .smallIcons: return true
         default: return false
         }
-    }
-}
-
-// MARK: - 복사 진행 시트
-
-private struct CopyProgressSheet: View {
-    let progress: OperationProgress?
-
-    var body: some View {
-        VStack(spacing: 20) {
-            Text("파일 복사 중...")
-                .font(.headline)
-
-            if let p = progress, p.total > 0 {
-                ProgressView(value: p.fraction)
-                    .progressViewStyle(.linear)
-                    .frame(width: 320)
-
-                Text("\(p.current) / \(p.total)개")
-                    .fluentCaption()
-                    .foregroundStyle(.secondary)
-
-                if !p.fileName.isEmpty {
-                    Text(p.fileName)
-                        .fluentCaption()
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .frame(width: 320)
-                }
-            } else {
-                ProgressView()
-                    .controlSize(.regular)
-            }
-        }
-        .padding(32)
-        .frame(width: 400)
     }
 }

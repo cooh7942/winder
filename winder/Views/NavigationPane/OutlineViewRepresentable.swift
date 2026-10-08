@@ -28,6 +28,9 @@ final class NavNode: NSObject {
     let isSeparator: Bool
     /// B-2: 즐겨찾기로 등록한 폴더가 삭제·이동되어 해석 불가한 상태
     let isUnavailable: Bool
+    /// 폴더를 열거해 만든 일반 폴더 — 실제 이름을 바꿀 수 있는 항목.
+    /// 홈·볼륨·iCloud·즐겨찾기처럼 트리가 고정으로 만든 항목은 false
+    let isPlainFolder: Bool
     var children: [NavNode]?
     var isLoadingChildren = false
     /// C-7: 진행 중인 자식 로딩 Task 참조 — 중복 시작 방지 및 await 직접 가능
@@ -43,7 +46,8 @@ final class NavNode: NSObject {
 
     init(id: String, label: String, icon: String = "", url: URL? = nil,
          isSection: Bool = false, isSeparator: Bool = false,
-         children: [NavNode]? = nil, isUnavailable: Bool = false) {
+         children: [NavNode]? = nil, isUnavailable: Bool = false,
+         isPlainFolder: Bool = false) {
         self.nodeID       = id
         self.label        = label
         self.icon         = icon
@@ -51,6 +55,7 @@ final class NavNode: NSObject {
         self.isSection    = isSection
         self.isSeparator  = isSeparator
         self.isUnavailable = isUnavailable
+        self.isPlainFolder = isPlainFolder
         self.children     = children
     }
 }
@@ -217,9 +222,117 @@ final class NavOutlineCoordinator: NSObject,
     // B-5: 중복 드롭 펄스 추적
     var lastHighlightedID: UUID? = nil
 
+    /// Winder가 폴더 내용을 바꿨다는 알림 구독 — 펼쳐 둔 폴더에 새 폴더를 바로 보여 주려고
+    private let directoryChangeObserver = NotificationObserverBox()
+    /// 다른 프로세스(터미널·Finder 등)의 변경 감시 — 자식을 읽어 둔 폴더들을 지켜본다
+    private let treeWatcher = DirectorySetWatcher()
+    /// 감시 집합 갱신이 이미 예약됐는지 — 여러 노드가 한꺼번에 로드돼도 한 번만 다시 만든다
+    private var isWatchUpdateScheduled = false
+
     override init() {
         super.init()
         roots = [favoritesNode] + NavOutlineCoordinator.buildRoots()
+        observeDirectoryChanges()
+        treeWatcher.onChange = { [weak self] paths in
+            self?.refreshLoadedNodes(atPaths: paths)
+        }
+    }
+
+    // MARK: 폴더 변경 반영
+
+    /// 파일 목록에서 새 폴더를 만들거나 이름을 바꾸면 트리에도 곧바로 나타나야 한다.
+    /// 트리는 한 번 읽은 자식을 캐시해 두므로, 알림을 받아 해당 폴더만 다시 읽는다
+    private func observeDirectoryChanges() {
+        directoryChangeObserver.token = NotificationCenter.default.addObserver(
+            forName: .winderDirectoriesDidChange, object: nil, queue: nil
+        ) { [weak self] note in
+            guard let dirs = note.userInfo?[FileOperationService.changedDirectoriesKey] as? Set<URL>
+            else { return }
+            Task { @MainActor [weak self] in self?.refreshLoadedNodes(in: dirs) }
+        }
+    }
+
+    /// 자식을 이미 읽어 둔 노드 중 바뀐 폴더를 가리키는 것을 다시 읽는다.
+    /// 같은 폴더가 즐겨찾기와 홈 아래에 함께 펼쳐져 있을 수 있어 트리 전체를 훑는다
+    private func refreshLoadedNodes(in dirs: Set<URL>) {
+        refreshLoadedNodes(atPaths: Set(dirs.map(\.standardizedFileURL.path)))
+    }
+
+    private func refreshLoadedNodes(atPaths paths: Set<String>) {
+        var stack = roots
+        while let node = stack.popLast() {
+            guard let children = node.children else { continue }
+            stack.append(contentsOf: children)
+            if !node.isSection, let url = node.url, url.isFileURL,
+               paths.contains(url.standardizedFileURL.path) {
+                Task { await self.refreshChildren(of: node) }
+            }
+        }
+    }
+
+    /// 자식을 읽어 둔 폴더 전부를 감시 대상으로 맞춘다.
+    ///
+    /// 접혀 있어도 읽어 둔 목록은 다시 펼칠 때 그대로 쓰이므로 함께 감시한다.
+    /// 자식 목록이 바뀌는 곳(로딩·갱신·즐겨찾기·볼륨 재구성)에서 부르고, 실제 갱신은 한 번으로 모은다
+    private func scheduleWatchUpdate() {
+        guard !isWatchUpdateScheduled else { return }
+        isWatchUpdateScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.isWatchUpdateScheduled = false
+            var paths: Set<String> = []
+            var stack = self.roots
+            while let node = stack.popLast() {
+                guard let children = node.children else { continue }
+                stack.append(contentsOf: children)
+                if !node.isSection, let url = node.url, url.isFileURL {
+                    paths.insert(url.standardizedFileURL.path)
+                }
+            }
+            self.treeWatcher.update(paths: paths)
+        }
+    }
+
+    /// 이미 읽은 자식 목록을 디스크와 다시 맞춘다.
+    ///
+    /// 통째로 reloadItem하지 않고 바뀐 행만 넣고 뺀다 — 그대로인 자식은 같은 NavNode를 다시 써서
+    /// 그 아래 펼침 상태와 선택, 진행 중인 인라인 편집이 그대로 남는다
+    func refreshChildren(of node: NavNode) async {
+        guard let url = node.url, node.children != nil, node.loadingTask == nil else { return }
+        let entries = await Self.folderEnumerationTask(for: url).value
+        // 읽는 사이 새로 고침으로 비워졌으면 그쪽 로딩에 맡긴다
+        guard let old = node.children else { return }
+
+        let oldByID = Dictionary(old.map { ($0.nodeID, $0) }, uniquingKeysWith: { first, _ in first })
+        let new = entries.map { entry in
+            oldByID[entry.url.path] ?? Self.makeFolderNode(entry)
+        }
+        let diff = new.map(\.nodeID).difference(from: old.map(\.nodeID))
+        guard !diff.isEmpty else { return }
+        node.children = new
+        scheduleWatchUpdate()
+
+        guard outlineView.isItemExpanded(node) else {
+            // 접혀 있으면 보이는 행이 없다 — 펼침 삼각형만 맞춘다
+            reloadPreservingSelection(node)
+            return
+        }
+        // 지운 위치는 이전 목록 기준, 넣은 위치는 새 목록 기준 — CollectionDifference와 같은 규칙이다
+        var removed = IndexSet(), inserted = IndexSet()
+        for change in diff {
+            switch change {
+            case .remove(let offset, _, _): removed.insert(offset)
+            case .insert(let offset, _, _): inserted.insert(offset)
+            }
+        }
+        outlineView.beginUpdates()
+        outlineView.removeItems(at: removed, inParent: node, withAnimation: .effectFade)
+        outlineView.insertItems(at: inserted, inParent: node, withAnimation: .effectFade)
+        outlineView.endUpdates()
+        // 자식이 생기거나 모두 없어지면 펼침 삼각형이 바뀐다
+        if old.isEmpty != new.isEmpty {
+            outlineView.reloadItem(node, reloadChildren: false)
+        }
     }
 
     // MARK: 네트워크 갱신
@@ -257,6 +370,7 @@ final class NavOutlineCoordinator: NSObject,
 
         let wasExpanded = outlineView.isItemExpanded(networkNode) || wantsNetworkExpanded
         networkNode.children = children
+        scheduleWatchUpdate()
         outlineView.reloadItem(networkNode, reloadChildren: true)
         if wasExpanded {
             outlineView.expandItem(networkNode)
@@ -323,6 +437,7 @@ final class NavOutlineCoordinator: NSObject,
         let unchanged = rebuilt.count == previous.count
             && zip(rebuilt, previous).allSatisfy { $0 === $1 }
         favoritesNode.children = rebuilt
+        scheduleWatchUpdate()
         if !unchanged {
             outlineView.reloadItem(favoritesNode, reloadChildren: true)
         }
@@ -517,19 +632,12 @@ final class NavOutlineCoordinator: NSObject,
         let allURLs = (pb.readObjects(forClasses: [NSURL.self],
                                       options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
 
-        // B-4: 일반 폴더 노드로 파일 드롭 → 이동/복사
+        // B-4: 일반 폴더 노드로 파일 드롭 → 복사할지 이동할지 놓은 자리에서 묻는다
         if let targetNode = item as? NavNode,
            targetNode.isNavigable,
            let targetURL = targetNode.url,
            !allURLs.isEmpty {
-            let isCopy = info.draggingSourceOperationMask.contains(.copy)
-            Task { @MainActor in
-                if isCopy {
-                    _ = try? await FileOperationService.shared.copyItems(allURLs, to: targetURL)
-                } else {
-                    _ = try? await FileOperationService.shared.moveItems(allURLs, to: targetURL)
-                }
-            }
+            performFileDrop(allURLs, into: targetURL)
             return true
         }
 
@@ -688,6 +796,7 @@ final class NavOutlineCoordinator: NSObject,
             } else {
                 addNavMenuItem(menu, title: "열기", action: #selector(favOpen))
                 menu.addItem(.separator())
+                addNavMenuItem(menu, title: "새 폴더", action: #selector(navNewFolder))
                 // C: "표시 이름 바꾸기" — 실제 폴더 이름은 변경하지 않음을 명확히
                 addNavMenuItem(menu, title: "표시 이름 바꾸기", action: #selector(favRename))
                 addNavMenuItem(menu, title: "즐겨찾기에서 제거", action: #selector(favRemove))
@@ -701,6 +810,15 @@ final class NavOutlineCoordinator: NSObject,
             addNavMenuItem(menu, title: "Finder에서 휴지통 열기", action: #selector(trashOpenInFinder))
         } else if node.isNavigable, node.url != nil {
             addNavMenuItem(menu, title: "열기", action: #selector(navOpen))
+            menu.addItem(.separator())
+            // 마운트 전 네트워크 서버(smb:// 등)에는 만들 수 없다
+            if node.url?.isFileURL == true {
+                addNavMenuItem(menu, title: "새 폴더", action: #selector(navNewFolder))
+            }
+            // 홈·볼륨처럼 고정 항목의 실제 이름은 바꾸지 않는다
+            if node.isPlainFolder {
+                addNavMenuItem(menu, title: "이름 바꾸기", action: #selector(navRename))
+            }
             menu.addItem(.separator())
             addNavMenuItem(menu, title: "즐겨찾기에 추가", action: #selector(navAddToFavorites))
             addNavMenuItem(menu, title: "Finder에서 보기", action: #selector(navRevealInFinder))
@@ -755,6 +873,7 @@ final class NavOutlineCoordinator: NSObject,
         let expandedIDs = Set(roots.filter { outlineView.isItemExpanded($0) }.map(\.nodeID))
         roots = [favoritesNode] + NavOutlineCoordinator.buildRoots()
         outlineView.reloadData()
+        scheduleWatchUpdate()
         for root in roots where expandedIDs.contains(root.nodeID) {
             outlineView.expandItem(root, expandChildren: false)
         }
@@ -832,6 +951,113 @@ final class NavOutlineCoordinator: NSObject,
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
+    // MARK: 새 폴더·이름 바꾸기
+
+    /// 우클릭한 폴더 안에 새 폴더를 만들고 바로 이름 편집에 들어간다 (Finder의 새 폴더와 같은 흐름)
+    @objc private func navNewFolder() {
+        let row = outlineView.clickedRow
+        guard row >= 0,
+              let node = outlineView.item(atRow: row) as? NavNode,
+              let parentURL = node.url, parentURL.isFileURL else { return }
+        Task { @MainActor [weak self] in
+            do {
+                let created = try await FileOperationService.shared.createFolder(in: parentURL)
+                UndoService.shared.push(.init(description: "새 폴더", affectedDirectories: [parentURL]) {
+                    try FileManager.default.removeItem(at: created)
+                })
+                await self?.beginRenamingNewFolder(created, in: node)
+            } catch {
+                self?.presentError(error.localizedDescription)
+            }
+        }
+    }
+
+    @objc private func navRename() {
+        let row = outlineView.clickedRow
+        guard row >= 0,
+              let node = outlineView.item(atRow: row) as? NavNode,
+              node.isPlainFolder else { return }
+        beginRenaming(node, row: row)
+    }
+
+    /// 만든 폴더가 보이도록 부모를 펼친 뒤 그 행에서 이름 편집을 시작한다
+    private func beginRenamingNewFolder(_ url: URL, in parent: NavNode) async {
+        // 변경 알림으로도 다시 읽히지만, 끝나기를 기다려야 새 행을 찾을 수 있어 직접 기다린다
+        if parent.children == nil {
+            await loadChildren(of: parent)
+        } else {
+            await refreshChildren(of: parent)
+        }
+        outlineView.expandItem(parent)
+        let path = url.standardizedFileURL.path
+        guard let child = parent.children?.first(where: { $0.url?.standardizedFileURL.path == path })
+        else { return }
+        let row = outlineView.row(forItem: child)
+        guard row >= 0 else { return }
+        outlineView.scrollRowToVisible(row)
+        beginRenaming(child, row: row)
+    }
+
+    private func beginRenaming(_ node: NavNode, row: Int) {
+        guard let cell = outlineView.view(atColumn: 0, row: row,
+                                          makeIfNecessary: true) as? NavCellView else { return }
+        cell.startEditing(currentName: node.label) { [weak self] newName in
+            self?.renameFolder(node, to: newName)
+        }
+    }
+
+    /// 실제 폴더 이름을 바꾼다 — 즐겨찾기의 "표시 이름 바꾸기"와 달리 디스크의 이름이 바뀐다
+    private func renameFolder(_ node: NavNode, to rawName: String) {
+        guard let oldURL = node.url else { return }
+        let newName = rawName.trimmingCharacters(in: .whitespaces)
+        guard !newName.isEmpty, newName != node.label, newName != oldURL.lastPathComponent else { return }
+        if let reason = FileOperationService.invalidNameReason(newName) {
+            outlineView.reloadItem(node)   // 입력한 글자를 원래 이름으로 되돌린다
+            presentError(reason)
+            return
+        }
+        let parent = outlineView.parent(forItem: node) as? NavNode
+        Task { @MainActor [weak self] in
+            do {
+                // 성공하면 변경 알림으로 부모가 다시 읽혀 옛 행이 새 이름의 행으로 바뀐다
+                let newURL = try await FileOperationService.shared.rename(at: oldURL, to: newName)
+                UndoService.shared.push(.init(description: "이름 바꾸기",
+                                              affectedDirectories: [oldURL.deletingLastPathComponent()]) {
+                    try FileManager.default.moveItem(at: newURL, to: oldURL)
+                })
+                guard let self else { return }
+                // 새 이름의 행이 생긴 뒤에 따라가야 트리가 그 행을 선택한다 —
+                // 알림으로 도는 갱신을 기다리지 않으면 reveal이 옛 목록에서 찾다가 부모에 멈춘다
+                if let parent { await self.refreshChildren(of: parent) }
+                self.followRename(from: oldURL, to: newURL)
+            } catch {
+                self?.outlineView.reloadItem(node)
+                self?.presentError(error.localizedDescription)
+            }
+        }
+    }
+
+    /// 보고 있던 폴더(또는 그 하위)의 이름을 바꿨으면 파일 목록도 새 경로로 옮긴다 —
+    /// 옛 경로는 더 이상 없어서 그대로 두면 목록이 비고 이후 작업이 실패한다
+    private func followRename(from oldURL: URL, to newURL: URL) {
+        guard let currentPath = lastRevealedURL?.standardizedFileURL.path else { return }
+        let oldPath = oldURL.standardizedFileURL.path
+        guard currentPath == oldPath || currentPath.hasPrefix(oldPath + "/") else { return }
+        let suffix = currentPath.dropFirst(oldPath.count)
+        onNavigate(URL(fileURLWithPath: newURL.standardizedFileURL.path + suffix, isDirectory: true))
+    }
+
+    private func presentError(_ message: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = message
+        if let window = outlineView.window {
+            alert.beginSheetModal(for: window)
+        } else {
+            alert.runModal()
+        }
+    }
+
     // A-2: 권한 없이도 Finder로 휴지통 열기
     @objc private func trashOpenInFinder() {
         let row = outlineView.clickedRow
@@ -851,6 +1077,7 @@ final class NavOutlineCoordinator: NSObject,
             if node.children == nil {
                 node.children = Self.makeNodes(from: loaded)
                 reloadPreservingSelection(node)
+                scheduleWatchUpdate()
             }
             return
         }
@@ -858,12 +1085,27 @@ final class NavOutlineCoordinator: NSObject,
         guard let url = node.url else { node.children = []; return }
 
         node.isLoadingChildren = true
+        let task = Self.folderEnumerationTask(for: url)
+        node.loadingTask = task
+        let loaded = await task.value
+        node.loadingTask = nil
+        node.isLoadingChildren = false
+        // await 사이에 다른 경로(reveal 등)가 이미 자식을 채웠다면 덮어쓰지 않는다.
+        // 덮어쓰면 새 NavNode 객체로 교체되면서 reloadItem이 선택·펼침 상태를 날린다.
+        guard node.children == nil else { return }
+        node.children = Self.makeNodes(from: loaded)
+        reloadPreservingSelection(node)
+        scheduleWatchUpdate()
+    }
+
+    /// 트리에 보일 하위 폴더 목록을 백그라운드에서 읽는다.
+    /// 디스크 접근(열거·displayName)만 여기서 하고 NavNode 생성은 메인 액터에서 —
+    /// NavNode는 메인 액터 격리 타입이라 detached 태스크 안에서 만들 수 없다
+    private static func folderEnumerationTask(for url: URL) -> Task<[ChildEntry], Never> {
         // 두 제외 규칙은 홈뿐 아니라 모든 노드에 적용한다 (판단 근거는 아래 주석 참고)
         let userLibraryPath = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library").standardizedFileURL.path
-        // 디스크 접근(열거·displayName)만 백그라운드에서 하고 NavNode 생성은 메인 액터에서 —
-        // NavNode는 메인 액터 격리 타입이라 detached 태스크 안에서 만들 수 없다
-        let task = Task.detached(priority: .userInitiated) { () -> [ChildEntry] in
+        return Task.detached(priority: .userInitiated) { () -> [ChildEntry] in
             let subDirs = (try? FileManager.default.contentsOfDirectory(
                 at: url,
                 includingPropertiesForKeys: [.isDirectoryKey, .isPackageKey, .nameKey],
@@ -885,15 +1127,6 @@ final class NavOutlineCoordinator: NSObject,
                 .sorted { $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending }
                 .map { ChildEntry(url: $0, displayName: FileManager.default.displayName(atPath: $0.path)) }
         }
-        node.loadingTask = task
-        let loaded = await task.value
-        node.loadingTask = nil
-        node.isLoadingChildren = false
-        // await 사이에 다른 경로(reveal 등)가 이미 자식을 채웠다면 덮어쓰지 않는다.
-        // 덮어쓰면 새 NavNode 객체로 교체되면서 reloadItem이 선택·펼침 상태를 날린다.
-        guard node.children == nil else { return }
-        node.children = Self.makeNodes(from: loaded)
-        reloadPreservingSelection(node)
     }
 
     /// reloadItem은 선택을 해제하므로, 선택 노드가 여전히 트리에 있으면 되돌린다.
@@ -913,8 +1146,12 @@ final class NavOutlineCoordinator: NSObject,
     }
 
     private static func makeNodes(from entries: [ChildEntry]) -> [NavNode] {
-        entries.map { NavNode(id: $0.url.path, label: $0.displayName,
-                              icon: FluentIcons.folder, url: $0.url) }
+        entries.map { makeFolderNode($0) }
+    }
+
+    private static func makeFolderNode(_ entry: ChildEntry) -> NavNode {
+        NavNode(id: entry.url.path, label: entry.displayName,
+                icon: FluentIcons.folder, url: entry.url, isPlainFolder: true)
     }
 
     // MARK: 기능 2: reveal 스케줄링
@@ -1142,6 +1379,8 @@ final class NavCellView: NSView, NSTextFieldDelegate {
     private let label     = NSTextField()
     /// 섹션 머리글·안내 문구는 선택되지 않으므로 선택 색을 입히지 않는다
     private var isSelectableNode = false
+    /// 마지막으로 받은 선택 상태 — 편집이 끝나면 이 색으로 되돌린다
+    private var selectionState = (selected: false, emphasized: false)
 
     /// C-6: 이름 바꾸기 완료 시 호출되는 핸들러
     private var onCommitRename: ((String) -> Void)?
@@ -1198,15 +1437,18 @@ final class NavCellView: NSView, NSTextFieldDelegate {
         label.backgroundColor = .textBackgroundColor
         label.isBordered = true
         label.focusRingType = .exterior
+        // 선택 알약 위의 흰 글자는 편집 칸 배경에서 보이지 않는다
+        label.textColor = FluentColors.textPrimary
         label.delegate = self
-        // A-1: makeFirstResponder 먼저 → 필드 에디터 설치 후 selectText
-        // 반대 순서(selectText → makeFirstResponder)이면 makeFirstResponder가
-        // selectText가 시작한 편집 세션을 종료해 controlTextDidEndEditing이 즉시 발화됨
+        // selectText(_:)를 부르면 안 된다 — 내부에서 window.endEditingFor:로 필드 편집기를
+        // 한 번 걷어내는데, 그 과정이 controlTextDidEndEditing을 불러 방금 켠 편집이 바로 끝난다
+        // (자세히 보기 WinTableCellView와 같은 문제). makeFirstResponder만으로 편집기가 붙고
+        // 글자도 전체 선택된다.
         window?.makeFirstResponder(label)
-        label.selectText(nil)
     }
 
     private func endEditing(commit: Bool) {
+        guard isRenaming else { return }
         isRenaming = false
         let value = label.stringValue
         label.isEditable = false
@@ -1216,6 +1458,12 @@ final class NavCellView: NSView, NSTextFieldDelegate {
         label.isBordered = false
         label.focusRingType = .none
         label.delegate = nil
+        // Esc로 끝내면 필드 편집기가 첫 응답자로 남아 키 입력(화살표·⌘Z)을 계속 가져간다 —
+        // 트리에 돌려준다. delegate를 먼저 끊었으므로 이 과정의 편집 종료 알림은 다시 오지 않는다
+        if let window, let editor = label.currentEditor(), window.firstResponder === editor {
+            window.makeFirstResponder(enclosingScrollView?.documentView)
+        }
+        setSelected(selectionState.selected, emphasized: selectionState.emphasized)
         if commit, !value.trimmingCharacters(in: .whitespaces).isEmpty {
             onCommitRename?(value)
         } else {
@@ -1286,7 +1534,8 @@ final class NavCellView: NSView, NSTextFieldDelegate {
     /// Finder 사이드바 규칙 — 평소 아이콘은 회색, 선택되면 액센트,
     /// 액센트 알약이 깔린 상태(창에 포커스 있음)에서는 글자·아이콘 모두 흰색
     func setSelected(_ selected: Bool, emphasized: Bool) {
-        guard isSelectableNode else { return }
+        selectionState = (selected, emphasized)
+        guard isSelectableNode, !isRenaming else { return }
         let onAccent = selected && emphasized
         label.textColor = onAccent ? FluentColors.selectionText : FluentColors.textPrimary
         iconView.contentTintColor = onAccent
